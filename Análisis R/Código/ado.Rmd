@@ -1,0 +1,170 @@
+---
+title: "PCA_vcf"
+author: "Paco"
+date: "2025-03-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Análisis del fichero VCF obtenido en el pipeline 
+En este markdown se expone el procesamiento y análisis realizado para extraer información de interés sobre las variantes filtradas. 
+Dado que se proponen realizar técnicas de reducción de la dimensionalidad necesitamos retransformar el vcf y construir un nuevo dataset con las etiquetas de las muestras, el genotipo renombrado(homocigosis alelo referencia= 0, homocigosis recesivo=2, heterocigosis=1 y en caso de no presentarlo lo asignamos como NOT AVIABLE o NA)
+
+## Preprocesamiento del dataset
+
+### Carga del DataSet Y Transformación
+Vamos a tener Na por lo que va ser necesario eliminarar aquellas variantes con x valor de Na, por lo que necesitamos un umbral. Esto no supondrá un sesgo dado que una eliminación controlada es beneficiosa y partimos de 59251 variantes.
+```{r}
+library(vcfR)
+
+vcf <- read.vcfR("data.vcf")#leemos el fichero VCF con las variantes filtradas tras el variant calling
+
+gt <- extract.gt(vcf, element = "GT", as.numeric = FALSE)#necesitamos conocer el fenotipo para renombar
+
+gt_num <- gt
+gt_num[gt == "0/0"] <- 0
+gt_num[gt == "0/1" | gt == "1/0"] <- 1
+gt_num[gt == "1/1"] <- 2
+gt_num[gt == "./." | gt == "."] <- NA  # valores faltantes
+
+# Convertir a numeric matrix
+gt_num <- apply(gt_num, 2, as.numeric)  # columnas = muestras
+geno_matrix <- t(gt_num)  # cambiamos las muestras por filas
+print("Evaluamos presencia de NA")
+
+print("NA por MUESTRA: ")
+rowSums(is.na(geno_matrix))   # NA por muestra
+
+print("NA TOTALES")
+sum(colSums(is.na(geno_matrix)) > 0)
+```
+### Filtrado de NA
+En vista de la presencia de NA debemos optar por una estratregia mixta, eliminaremos variantes con un valor de NA que supere el 0.052% es decir que para 58 muestras solo permitiremos 3 NA como máximo.
+```{r}
+n_muestras <- nrow(geno_matrix)
+umbral_na <- 0.052 * n_muestras
+geno_filtrado_na <- geno_matrix[, colSums(is.na(geno_matrix)) <= umbral_na]
+
+# Vemos el numero total de columnas con dicho filtro
+sum(colSums(is.na(geno_matrix)) > umbral_na)
+
+geno_matrix=geno_filtrado_na
+
+
+```
+### Imputación de NA y tratamiento de Variantes con varianza 0.
+
+Tras esto hemos eliminado 1893 variantes con mas de tres NA por columna. El siguiente paso es imputar aquellas variantes con Na restantes. 
+Para ello realizaremos una imputación básica por la media, dado que esta es la más habitual en este tipo de casos donde tenemos valores 0,1 y 2. Si fueran valores con extremos lo más correcto sería imputar con la mediana con librerias como VIM. Además, realizaremos un análisis de variantes con varianza 0, es decir no aporta nada de peso durante el cálculo de un análisis de componentes principales o bien en UMAP, usaremos la función find correlation de la librería caret.
+
+```{r}
+#calculamos la media por columna y sustituimos el NA por el valor de la medida. 
+for (i in 1:ncol(geno_matrix)) {
+  geno_matrix[is.na(geno_matrix[, i]), i] <- mean(geno_matrix[, i], na.rm = TRUE)
+}
+print(paste0("na detectados tras imputar: ",sum(is.na(geno_matrix))))
+
+library(caret)
+nzv <- nearZeroVar(geno_matrix, saveMetrics = TRUE)
+
+suma=sum(nzv$nzv)
+print(paste("Numero de columnas con varianza proxima a 0:",suma))
+geno_final <- geno_matrix[, !nzv$nzv]
+
+#Finalmente escalamos y centramos los datos
+geno_final<-scale(geno_final)
+
+
+```
+Observamos que ya no tenemos Na en nuestro dataset, que se han eliminado un total de 5157 variantes con varianza 0 o cercana a 0 y se han centrado y escalado los datos por lo que ya disponemos de un dataset para realizar reducción de dimensionalidad.
+
+## UMAP
+
+### Análisis csv con subgeneros por muestra 
+Finalmente con el data set preprocesado se puede cargar el archivo csv que contiene los subgeneros para cada cruce, pero antes podemos evaluar la representación de cada subgenero en el dataset para valorar el balanceo de clases. 
+```{r}
+#cargamos un csv que contiene los subgéneros más posibles para cada cruce
+subgeneros <- read.csv("Cruces_Prunus_Clasificados.csv")
+
+# Contar accesiones por subgénero
+tabla_frecuencias <- table(subgeneros$Subgénero.asignado)
+
+# Definir colores en el mismo orden que aparecen en la tabla
+colores_ordenados <- c("Ambigua" = "grey",
+                       "Amygdalus" = "red",
+                       "Cerasus" = "yellow",
+                       "Prunus" = "blue")
+
+# Reordenar colores según el orden de los factores en la tabla
+colores_usar <- colores_ordenados[names(tabla_frecuencias)]
+
+# Graficar
+barplot(tabla_frecuencias,
+        col = colores_usar,
+        main = "Cantidad de accesiones por subgénero",
+        ylab = "Número de accesiones",
+        xlab = "Subgénero",
+        las = 2)  # Rotar etiquetas si son largas
+
+```
+
+Como se observa existe un claro desbalance de clases, lo que puede influir en la clusterización visual que genere UMAP. 
+
+
+### Reducción de la dimensionalidad en 2 componentes UMAP
+
+Para obtener los resultados propuestos se realizó una configuración exploratoria manual de los parámetros de UMAP.
+
+Se seleccionó la configuración con n_neighbors = 8 y min_dist = 0.05 como representación final, ya que daba la mejor combinación entre separación de subgéneros, compactación interna de los grupos, y posicionamiento con sentido de los híbridos.
+
+Esta parametrización permitió visualizar la estructura genética sin perder información biológicamente relevante, y fue robusta frente a la variabilidad del número de accesiones por grupo, que tal como comentamos es desbalanceada.
+```{r}
+library(umap)
+library(ggplot2)
+
+# Leemos csv con información de muestras
+cruces <- read.csv("Cruces_Prunus_Clasificados.csv")
+
+
+# Calcular UMAP
+config <- umap.defaults
+config$n_neighbors <- 8       
+config$min_dist <- 0.05           
+config$metric <- "cosine"      
+config$random_state <- 42  # semilla de reproducibilidad
+
+# Ejecutar UMAP con esta configuración
+umap_result <- umap(geno_final, config = config)
+
+# Crear dataframe con resultados
+df_umap <- data.frame(
+  Muestra = rownames(geno_final),
+  UMAP1 = umap_result$layout[, 1],
+  UMAP2 = umap_result$layout[, 2]
+)
+
+
+# Agregar subgénero en un dataframe final donde tendremos las dimensiones de umap por muestra y el subgenero
+df_umap <- merge(df_umap, cruces[, c("Run", "Subgénero.asignado")],
+                 by.x = "Muestra", by.y = "Run", all.x = TRUE)
+
+
+# Paleta de colores
+subgenero_colores <- c(
+  "Amygdalus" = "red",
+  "Prunus" = "blue",
+  "Cerasus" = "yellow",
+  "Ambigua" = "grey"
+)
+
+# visualizamos umap
+ggplot(df_umap, aes(x = UMAP1, y = UMAP2, color = Subgénero.asignado)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = subgenero_colores) +
+  theme_minimal() +
+  labs(title = "UMAPdel Perfil de Variantes por muestra (coloreado por subgénero)",
+       color = "Subgénero")
+
+```
